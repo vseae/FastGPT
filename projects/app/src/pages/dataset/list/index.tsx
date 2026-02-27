@@ -64,18 +64,9 @@ const Dataset = () => {
   const [editFolderData, setEditFolderData] = useState<EditFolderFormType>();
   const [createDatasetType, setCreateDatasetType] = useState<CreateDatasetType>();
 
-  const onSelectDatasetType = useCallback(
-    (e: CreateDatasetType) => {
-      if (!feConfigs?.isPlus && [DatasetTypeEnum.websiteDataset].includes(e)) {
-        return toast({
-          status: 'warning',
-          title: t('common:commercial_function_tip')
-        });
-      }
-      setCreateDatasetType(e);
-    },
-    [t, toast, feConfigs]
-  );
+  const onSelectDatasetType = useCallback((e: CreateDatasetType) => {
+    setCreateDatasetType(e);
+  }, []);
 
   const RenderSearchInput = useMemo(
     () => (
