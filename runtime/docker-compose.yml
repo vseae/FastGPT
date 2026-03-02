@@ -1,0 +1,295 @@
+# 用于本地开发的 docker-compose 文件:
+# - FastGPT 主应用通过本地 pnpm dev 启动（端口 3000）
+# - 基础设施服务端口已映射到宿主机，供本地开发使用
+# - FastGPT-mcp-server 端口映射 3005:3000
+# - 建议修改账密后再运行
+
+# plugin auth token
+x-plugin-auth-token: &x-plugin-auth-token "token"
+# aiproxy token
+x-aiproxy-token: &x-aiproxy-token "token"
+# 数据库连接相关配置
+x-share-db-config: &x-share-db-config
+  MONGODB_URI: mongodb://myusername:mypassword@mongo:27017/fastgpt?authSource=admin
+  DB_MAX_LINK: 100
+  REDIS_URL: redis://default:mypassword@redis:6379
+  # @see https://doc.fastgpt.cn/docs/introduction/development/object-storage
+  STORAGE_VENDOR: minio # minio | aws-s3 | cos | oss
+  STORAGE_REGION: us-east-1
+  STORAGE_ACCESS_KEY_ID: minioadmin
+  STORAGE_SECRET_ACCESS_KEY: minioadmin
+  STORAGE_PUBLIC_BUCKET: fastgpt-public
+  STORAGE_PRIVATE_BUCKET: fastgpt-private
+  STORAGE_EXTERNAL_ENDPOINT: http://192.168.2.103:9000 # 一个服务器和客户端均可访问到存储桶的地址，可以是固定的宿主机 IP 或者域名，注意不要填写成 127.0.0.1 或者 localhost 等本地回环地址(因为容器里无法使用)
+  STORAGE_S3_ENDPOINT: http://fastgpt-minio:9000 # 协议://域名(IP):端口
+  STORAGE_S3_FORCE_PATH_STYLE: true
+  STORAGE_S3_MAX_RETRIES: 3
+# Log 配置
+x-log-config: &x-log-config
+  LOG_ENABLE_CONSOLE: true
+  LOG_CONSOLE_LEVEL: debug
+  LOG_ENABLE_OTEL: false
+  LOG_OTEL_LEVEL: info
+  LOG_OTEL_URL: http://localhost:4318/v1/logs
+
+# 向量库相关配置
+x-vec-config: &x-vec-config
+  MILVUS_ADDRESS: http://milvusStandalone:19530
+  MILVUS_TOKEN: none
+
+version: "3.3"
+services:
+  # Vector DB
+  milvus-minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    networks:
+      - vector
+    volumes:
+      - ./milvus-minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+  # milvus
+  milvus-etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    networks:
+      - vector
+    volumes:
+      - ./milvus/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+  vectorDB:
+    container_name: milvusStandalone
+    image: milvusdb/milvus:v2.4.3
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    networks:
+      - fastgpt
+      - vector
+    ports:
+      - 19530:19530
+    volumes:
+      - ./milvus/data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    depends_on:
+      - "milvus-etcd"
+      - "milvus-minio"
+  mongo:
+    image: registry.cn-hangzhou.aliyuncs.com/fastgpt/mongo:5.0.32 # cpu 不支持 AVX 时候使用 4.4.29
+    container_name: mongo
+    restart: always
+    ports:
+      - 27017:27017
+    networks:
+      - fastgpt
+    command: mongod --keyFile /data/mongodb.key --replSet rs0
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=myusername
+      - MONGO_INITDB_ROOT_PASSWORD=mypassword
+    volumes:
+      - ./mongo/data:/data/db
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongo",
+          "-u",
+          "myusername",
+          "-p",
+          "mypassword",
+          "--authenticationDatabase",
+          "admin",
+          "--eval",
+          "db.adminCommand('ping')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    entrypoint:
+      - bash
+      - -c
+      - |
+        openssl rand -base64 128 > /data/mongodb.key
+        chmod 400 /data/mongodb.key
+        chown 999:999 /data/mongodb.key
+        echo 'const isInited = rs.status().ok === 1
+        if(!isInited){
+          rs.initiate({
+              _id: "rs0",
+              members: [
+                  { _id: 0, host: "mongo:27017" }
+              ]
+          })
+        }' > /data/initReplicaSet.js
+        # 启动MongoDB服务
+        exec docker-entrypoint.sh "$$@" &
+
+        # 等待MongoDB服务启动
+        until mongo -u myusername -p mypassword --authenticationDatabase admin --eval "print('waited for connection')"; do
+          echo "Waiting for MongoDB to start..."
+          sleep 2
+        done
+
+        # 执行初始化副本集的脚本
+        mongo -u myusername -p mypassword --authenticationDatabase admin /data/initReplicaSet.js
+
+        # 等待docker-entrypoint.sh脚本执行的MongoDB服务进程
+        wait $$!
+  redis:
+    image: registry.cn-hangzhou.aliyuncs.com/fastgpt/redis:7.2-alpine
+    container_name: redis
+    networks:
+      - fastgpt
+    ports:
+      - 6380:6379
+    restart: always
+    command: |
+      redis-server --requirepass mypassword --loglevel warning --maxclients 10000 --appendonly yes --save 60 10 --maxmemory 4gb --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "mypassword", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - ./redis/data:/data
+  fastgpt-minio:
+    image: registry.cn-hangzhou.aliyuncs.com/fastgpt/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: fastgpt-minio
+    restart: always
+    ports:
+      - 9000:9000
+      - 9001:9001
+    networks:
+      - fastgpt
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - ./fastgpt-minio:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  sandbox:
+    container_name: sandbox
+    image: registry.cn-hangzhou.aliyuncs.com/fastgpt/fastgpt-sandbox:v4.14.7
+    networks:
+      - fastgpt
+    ports:
+      - 3002:3000
+    restart: always
+  fastgpt-mcp-server:
+    container_name: fastgpt-mcp-server
+    image: registry.cn-hangzhou.aliyuncs.com/fastgpt/fastgpt-mcp_server:v4.14.6
+    networks:
+      - fastgpt
+    ports:
+      - 3005:3000
+    restart: always
+    environment:
+      <<: [*x-log-config]
+      FASTGPT_ENDPOINT: http://host.docker.internal:3000
+  fastgpt-plugin:
+    image: registry.cn-hangzhou.aliyuncs.com/fastgpt/fastgpt-plugin:v0.5.4
+    container_name: fastgpt-plugin
+    restart: always
+    ports:
+      - 3003:3000
+    networks:
+      - fastgpt
+    environment:
+      <<: [*x-share-db-config, *x-log-config]
+      AUTH_TOKEN: *x-plugin-auth-token
+      # 工具网络请求，最大请求和响应体
+      SERVICE_REQUEST_MAX_CONTENT_LENGTH: 10
+      # 最大 API 请求体大小
+      MAX_API_SIZE: 10
+      # 传递给 OTLP 收集器的服务名称
+      LOG_OTEL_SERVICE_NAME: fastgpt-plugin
+    depends_on:
+      fastgpt-minio:
+        condition: service_healthy
+  # AI Proxy
+  aiproxy:
+    image: registry.cn-hangzhou.aliyuncs.com/labring/aiproxy:v0.3.5
+    container_name: aiproxy
+    restart: unless-stopped
+    depends_on:
+      aiproxy_pg:
+        condition: service_healthy
+    ports:
+      - 3010:3000
+    networks:
+      - fastgpt
+      - aiproxy
+    environment:
+      # 对应 fastgpt 里的AIPROXY_API_TOKEN
+      ADMIN_KEY: *x-aiproxy-token
+      # 错误日志详情保存时间（小时）
+      LOG_DETAIL_STORAGE_HOURS: 1
+      # 数据库连接地址
+      SQL_DSN: postgres://postgres:aiproxy@aiproxy_pg:5432/aiproxy
+      # 最大重试次数
+      RETRY_TIMES: 3
+      # 不需要计费
+      BILLING_ENABLED: false
+      # 不需要严格检测模型
+      DISABLE_MODEL_CONFIG: true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  aiproxy_pg:
+    image: registry.cn-hangzhou.aliyuncs.com/fastgpt/pgvector:0.8.0-pg15 # docker hub
+    restart: unless-stopped
+    container_name: aiproxy_pg
+    volumes:
+      - ./aiproxy_pg:/var/lib/postgresql/data
+    networks:
+      - aiproxy
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_USER: postgres
+      POSTGRES_DB: aiproxy
+      POSTGRES_PASSWORD: aiproxy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "aiproxy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+networks:
+  fastgpt:
+  aiproxy:
+  vector:

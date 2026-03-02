@@ -44,4 +44,9 @@ projects/app/worker/
 # Agent
 .codex
 
-runtime/*
+runtime/aiproxy_pg
+runtime/fastgpt-minio
+runtime/milvus
+runtime/milvus-minio
+runtime/mongo
+runtime/redis
